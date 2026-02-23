@@ -14,6 +14,15 @@
 #include "m3_exception.h"
 #include "m3_info.h"
 
+#if d_m3EnableLocalRegCaching && M3_HAS_TAIL_CALL && M3_COMPILER_HAS_ATTRIBUTE(musttail)
+    // When local-regcache is enabled, prefer direct branches to loop headers instead of
+    // op_ContinueLoop returns. This keeps cached locals in argument registers across loop
+    // backedges (and avoids per-iteration reloads).
+    #define d_m3UseBranchForLoopContinue 1
+#else
+    #define d_m3UseBranchForLoopContinue 0
+#endif
+
 //----- EMIT --------------------------------------------------------------------------------------------------------------
 
 static inline
@@ -91,7 +100,46 @@ static M3_NOINLINE
 void  EmitSlotOffset  (IM3Compilation o, const i32 i_offset)
 {
     if (o->page)
+    {
+        u32 * location = (u32 *) GetPagePC (o->page);
+
         EmitWord32 (o->page, i_offset);
+
+#if d_m3EnableLocalRegCaching
+        if (o->function && i_offset >= 0 && i_offset < d_m3MaxFunctionSlots)
+        {
+            i16 localIndex = o->slotToLocalIndex[(u16) i_offset];
+            if (localIndex >= 0)
+            {
+                if (o->numSlotOffsetPatches >= o->capSlotOffsetPatches)
+                {
+                    u32 newCap = o->capSlotOffsetPatches ? (o->capSlotOffsetPatches * 2u) : 128u;
+                    M3SlotOffsetPatch * newPatches = m3_ReallocArray (M3SlotOffsetPatch, o->slotOffsetPatches, newCap, o->capSlotOffsetPatches);
+
+                    // Best-effort: if allocation fails, stop recording patches for this function.
+                    if (newPatches)
+                    {
+                        o->slotOffsetPatches = newPatches;
+                        o->capSlotOffsetPatches = newCap;
+                    }
+                    else
+                    {
+                        o->capSlotOffsetPatches = 0;
+                        o->numSlotOffsetPatches = 0;
+                    }
+                }
+
+                if (o->capSlotOffsetPatches)
+                {
+                    M3SlotOffsetPatch * patch = & o->slotOffsetPatches[o->numSlotOffsetPatches++];
+                    patch->location = location;
+                    patch->slotOffset = (u16) i_offset;
+                    patch->localIndex = (u16) localIndex;
+                }
+            }
+        }
+#endif
+    }
 }
 
 static M3_NOINLINE
@@ -1298,6 +1346,11 @@ M3Result  Compile_SetLocal  (IM3Compilation o, m3opcode_t i_opcode)
     u32 localIndex;
 _   (ReadLEB_u32 (& localIndex, & o->wasm, o->wasmEnd));             //  printf ("--- set local: %d \n", localSlot);
 
+#if d_m3EnableLocalRegCaching
+    if (localIndex < d_m3MaxFunctionStackHeight)
+        ++o->localUseCounts[localIndex];
+#endif
+
     if (localIndex < GetFunctionNumArgsAndLocals (o->function))
     {
         u16 localSlot = GetSlotForStackIndex (o, localIndex);
@@ -1325,6 +1378,11 @@ _try {
 
     u32 localIndex;
 _   (ReadLEB_u32 (& localIndex, & o->wasm, o->wasmEnd));
+
+#if d_m3EnableLocalRegCaching
+    if (localIndex < d_m3MaxFunctionStackHeight)
+        ++o->localUseCounts[localIndex];
+#endif
 
     if (localIndex >= GetFunctionNumArgsAndLocals (o->function))
         _throw ("local index out of bounds");
@@ -1447,8 +1505,16 @@ _               (EmitSlotNumOfStackTopAndPop (o));
 
 _               (ResolveBlockResults (o, scope, /* isBranch: */ true));
 
-_               (EmitOp (o, op_ContinueLoop));
-                EmitPointer (o, scope->pc);
+                if (d_m3UseBranchForLoopContinue)
+                {
+_                   (EmitOp (o, op_Branch));
+                    EmitPointer (o, scope->pc);
+                }
+                else
+                {
+_                   (EmitOp (o, op_ContinueLoop));
+                    EmitPointer (o, scope->pc);
+                }
 
                 * jumpTo = GetPC (o);
             }
@@ -1458,16 +1524,32 @@ _               (EmitOp (o, op_ContinueLoop));
 _               (CopyStackTopToRegister (o, false));
 _               (PopType (o, c_m3Type_i32));
 
-_               (EmitOp (o, op_ContinueLoopIf));
-                EmitPointer (o, scope->pc);
+                if (d_m3UseBranchForLoopContinue)
+                {
+_                   (EmitOp (o, op_BranchIf_r));
+                    EmitPointer (o, scope->pc);
+                }
+                else
+                {
+_                   (EmitOp (o, op_ContinueLoopIf));
+                    EmitPointer (o, scope->pc);
+                }
             }
 
 //          dump_type_stack(o);
         }
         else // is c_waOp_branch
         {
-    _       (EmitOp (o, op_ContinueLoop));
-            EmitPointer (o, scope->pc);
+            if (d_m3UseBranchForLoopContinue)
+            {
+_               (EmitOp (o, op_Branch));
+                EmitPointer (o, scope->pc);
+            }
+            else
+            {
+_               (EmitOp (o, op_ContinueLoop));
+                EmitPointer (o, scope->pc);
+            }
             o->block.isPolymorphic = true;
         }
     }
@@ -1574,8 +1656,16 @@ _       (AcquireCompilationCodePage (o, & continueOpPage));
         {
 _           (ResolveBlockResults (o, scope, true));
 
-_           (EmitOp (o, op_ContinueLoop));
-            EmitPointer (o, scope->pc);
+            if (d_m3UseBranchForLoopContinue)
+            {
+_               (EmitOp (o, op_Branch));
+                EmitPointer (o, scope->pc);
+            }
+            else
+            {
+_               (EmitOp (o, op_ContinueLoop));
+                EmitPointer (o, scope->pc);
+            }
         }
         else
         {
@@ -1688,7 +1778,12 @@ _           (CompileCallArgsAndReturn (o, & slotTop, function->funcType, false))
 
 _           (EmitOp     (o, op));
             EmitPointer (o, operand);
-            EmitSlotOffset  (o, slotTop);
+            // stackOffset is used to compute the callee stack frame pointer (sp = _sp + stackOffset).
+            // It must never be patched/encoded for local-regcache.
+            EmitConstant32  (o, slotTop);
+#if d_m3EnableLocalRegCaching
+            EmitPointer (o, o->function);
+#endif
         }
         else
         {
@@ -1725,7 +1820,12 @@ _   (EmitOp         (o, op_CallIndirect));
     EmitSlotOffset  (o, tableIndexSlot);
     EmitPointer     (o, o->module);
     EmitPointer     (o, type);              // TODO: unify all types in M3Environment
-    EmitSlotOffset  (o, execTop);
+    // stackOffset is used to compute the callee stack frame pointer (sp = _sp + stackOffset).
+    // It must never be patched/encoded for local-regcache.
+    EmitConstant32  (o, execTop);
+#if d_m3EnableLocalRegCaching
+    EmitPointer     (o, o->function);
+#endif
 
 } _catch:
     return result;
@@ -1887,7 +1987,13 @@ _                       (CopyStackIndexToSlot (o, newSlot, i));
             }
         }
 
-_       (EmitOp (o, op_Loop));
+        if (!d_m3UseBranchForLoopContinue)
+        {
+_           (EmitOp (o, op_Loop));
+#if d_m3EnableLocalRegCaching
+            EmitPointer (o, o->function);
+#endif
+        }
     }
     else
     {
@@ -2837,6 +2943,152 @@ M3Result  ReserveConstants  (IM3Compilation o)
     return result;
 }
 
+#if d_m3EnableLocalRegCaching
+typedef struct M3LocalUseCount
+{
+    u16     localIndex;
+    u32     count;
+}
+M3LocalUseCount;
+
+static int  CompareLocalUseCountDesc  (const void * i_a, const void * i_b)
+{
+    const M3LocalUseCount * a = (const M3LocalUseCount *) i_a;
+    const M3LocalUseCount * b = (const M3LocalUseCount *) i_b;
+
+    if (a->count < b->count) return 1;
+    if (a->count > b->count) return -1;
+    return (a->localIndex > b->localIndex) - (a->localIndex < b->localIndex);
+}
+
+static inline bool  IsCacheableLocalIntType  (u8 i_type)
+{
+    return i_type == c_m3Type_i32 || i_type == c_m3Type_i64;
+}
+
+static inline bool  IsCacheableLocalFpType  (u8 i_type)
+{
+    // Only cache f64 locals for now.
+    // f32 locals can be copied/stored via u32 slot ops (bitwise), which requires
+    // extra handling to preserve exact bit patterns in the fp register cache.
+    return i_type == c_m3Type_f64;
+}
+
+static
+void  FinalizeLocalRegCache  (IM3Compilation o)
+{
+    IM3Function function = o->function;
+    if (not function) return;
+
+    const u32 numArgsAndLocals = GetFunctionNumArgsAndLocals (function);
+    if (numArgsAndLocals == 0) return;
+
+    // Candidate lists.
+    M3LocalUseCount intLocals[d_m3MaxFunctionStackHeight];
+    M3LocalUseCount fpLocals[d_m3MaxFunctionStackHeight];
+    u32 numInt = 0;
+    u32 numFp = 0;
+
+    for (u32 i = 0; i < numArgsAndLocals && i < d_m3MaxFunctionStackHeight; ++i)
+    {
+        const u32 count = o->localUseCounts[i];
+        if (count == 0) continue;
+
+        const u8 type = GetStackTypeFromBottom (o, (u16) i);
+
+        if (IsCacheableLocalIntType (type))
+        {
+            intLocals[numInt].localIndex = (u16) i;
+            intLocals[numInt].count = count;
+            ++numInt;
+        }
+#if d_m3HasFloat
+        else if (IsCacheableLocalFpType (type))
+        {
+            fpLocals[numFp].localIndex = (u16) i;
+            fpLocals[numFp].count = count;
+            ++numFp;
+        }
+#endif
+    }
+
+    if (numInt)
+        qsort (intLocals, numInt, sizeof (intLocals[0]), CompareLocalUseCountDesc);
+#if d_m3HasFloat
+    if (numFp)
+        qsort (fpLocals, numFp, sizeof (fpLocals[0]), CompareLocalUseCountDesc);
+#endif
+
+    i8 localToIntReg[d_m3MaxFunctionStackHeight];
+    i8 localToFpReg[d_m3MaxFunctionStackHeight];
+    memset (localToIntReg, -1, sizeof (localToIntReg));
+    memset (localToFpReg, -1, sizeof (localToFpReg));
+
+    // Select locals into the fixed register budget.
+    const u32 maxIntRegs = 4;
+    const u32 maxFpRegs = 7;
+
+    function->numLocalIntRegs = 0;
+    function->numLocalFpRegs = 0;
+
+    for (u32 i = 0; i < numInt && function->numLocalIntRegs < maxIntRegs; ++i)
+    {
+        const u16 localIndex = intLocals[i].localIndex;
+        const u8 type = GetStackTypeFromBottom (o, localIndex);
+        const u16 slot = GetSlotForStackIndex (o, localIndex);
+
+        const u8 regIndex = function->numLocalIntRegs++;
+        function->localIntRegSlots[regIndex] = slot;
+        function->localIntRegTypes[regIndex] = type;
+        localToIntReg[localIndex] = (i8) regIndex;
+    }
+
+#if d_m3HasFloat
+    for (u32 i = 0; i < numFp && function->numLocalFpRegs < maxFpRegs; ++i)
+    {
+        const u16 localIndex = fpLocals[i].localIndex;
+        const u8 type = GetStackTypeFromBottom (o, localIndex);
+        const u16 slot = GetSlotForStackIndex (o, localIndex);
+
+        const u8 regIndex = function->numLocalFpRegs++;
+        function->localFpRegSlots[regIndex] = slot;
+        function->localFpRegTypes[regIndex] = type;
+        localToFpReg[localIndex] = (i8) regIndex;
+    }
+#endif
+
+    // Patch any emitted slot offsets that reference cached locals.
+    for (u32 i = 0; i < o->numSlotOffsetPatches; ++i)
+    {
+        M3SlotOffsetPatch * patch = & o->slotOffsetPatches[i];
+        const u16 localIndex = patch->localIndex;
+
+        if (localIndex < d_m3MaxFunctionStackHeight)
+        {
+            i8 regIndex = localToIntReg[localIndex];
+            u32 kind = 0;
+
+            if (regIndex < 0)
+            {
+                kind = 1;
+                regIndex = localToFpReg[localIndex];
+            }
+
+            if (regIndex >= 0)
+            {
+                const u32 encoded = m3EncodeLocalOffset (kind, (u32) regIndex, (u32) patch->slotOffset);
+                * patch->location = encoded;
+            }
+        }
+    }
+
+    m3_Free (o->slotOffsetPatches);
+    o->slotOffsetPatches = NULL;
+    o->numSlotOffsetPatches = 0;
+    o->capSlotOffsetPatches = 0;
+}
+#endif // d_m3EnableLocalRegCaching
+
 
 M3Result  CompileFunction  (IM3Function io_function)
 {
@@ -2848,6 +3100,10 @@ M3Result  CompileFunction  (IM3Function io_function)
 
     IM3Compilation o = & runtime->compilation;                      d_m3Assert (d_m3MaxFunctionSlots >= d_m3MaxFunctionStackHeight * (d_m3Use32BitSlots + 1))  // need twice as many slots in 32-bit mode
     memset (o, 0x0, sizeof (M3Compilation));
+
+#if d_m3EnableLocalRegCaching
+    memset (o->slotToLocalIndex, 0xFF, sizeof (o->slotToLocalIndex));
+#endif
 
     o->runtime  = runtime;
     o->module   = io_function->module;
@@ -2888,6 +3144,22 @@ _       (PushAllocatedSlot (o, type));
 
 _   (CompileLocals (o));
 
+#if d_m3EnableLocalRegCaching
+    {
+        u32 numArgsAndLocals = GetFunctionNumArgsAndLocals (o->function);
+        for (u32 i = 0; i < numArgsAndLocals; ++i)
+        {
+            u16 slot = GetSlotForStackIndex (o, (u16) i);
+            if (slot < d_m3MaxFunctionSlots)
+                o->slotToLocalIndex[slot] = (i16) i;
+        }
+
+        // Clear any previous function-cache state; will be filled after compilation.
+        io_function->numLocalIntRegs = 0;
+        io_function->numLocalFpRegs = 0;
+    }
+#endif
+
     u16 maxSlot = GetMaxUsedSlotPlusOne (o);
 
     o->function->numLocalBytes = (maxSlot - o->slotFirstLocalIndex) * sizeof (m3slot_t);
@@ -2910,6 +3182,10 @@ _   (CompileBlockStatements (o));
     // TODO: validate opcode sequences
     _throwif(m3Err_wasmMalformed, o->previousOpcode != c_waOp_end);
 
+#if d_m3EnableLocalRegCaching
+    FinalizeLocalRegCache (o);
+#endif
+
     io_function->compiled = pc;
     io_function->maxStackSlots = o->maxStackSlots;
 
@@ -2924,6 +3200,13 @@ _   (CompileBlockStatements (o));
     }
 
 } _catch:
+
+#if d_m3EnableLocalRegCaching
+    m3_Free (o->slotOffsetPatches);
+    o->slotOffsetPatches = NULL;
+    o->numSlotOffsetPatches = 0;
+    o->capSlotOffsetPatches = 0;
+#endif
 
     ReleaseCompilationCodePage (o);
 

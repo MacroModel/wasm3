@@ -69,6 +69,16 @@ M3CompilationScope;
 
 typedef M3CompilationScope *        IM3CompilationScope;
 
+#if d_m3EnableLocalRegCaching
+typedef struct M3SlotOffsetPatch
+{
+    u32 *   location;
+    u16     slotOffset;
+    u16     localIndex;
+}
+M3SlotOffsetPatch;
+#endif
+
 typedef struct
 {
     IM3Runtime          runtime;
@@ -115,6 +125,16 @@ typedef struct
     u16                 regStackIndexPlusOne        [2];
 
     m3opcode_t          previousOpcode;
+
+#if d_m3EnableLocalRegCaching
+    // Local usage counts (args + locals) and slot-offset patching for encoded cached locals.
+    u32                 localUseCounts              [d_m3MaxFunctionStackHeight];
+    i16                 slotToLocalIndex            [d_m3MaxFunctionSlots];     // -1 for non-(arg/local) slots
+
+    M3SlotOffsetPatch * slotOffsetPatches;
+    u32                 numSlotOffsetPatches;
+    u32                 capSlotOffsetPatches;
+#endif
 }
 M3Compilation;
 

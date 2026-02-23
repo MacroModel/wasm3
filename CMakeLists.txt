@@ -26,6 +26,9 @@ endif()
 set_property(CACHE BUILD_WASI PROPERTY STRINGS none simple uvwasi metawasi)
 
 option(BUILD_NATIVE "Build with machine-specific optimisations" ON)
+option(M3_LOCAL_REGCACHE "Enable AArch64 local register caching (experimental)" OFF)
+option(M3_LOCAL_REGCACHE_VALIDATE "Validate AArch64 local register caching (debug)" OFF)
+option(M3_RECORD_BACKTRACES "Record wasm backtraces (debug)" OFF)
 
 set(OUT_FILE "wasm3")
 
@@ -112,6 +115,9 @@ if(EMSCRIPTEN OR EMSCRIPTEN_LIB)
 
   set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -flto -Wfatal-errors -s ASSERTIONS=0")
   set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} --strip-all --gc-sections")
+  set(CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASE} -g")
+  string(REPLACE " -s ASSERTIONS=0" "" CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASDBG}")
+  set(CMAKE_EXE_LINKER_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASDBG} --gc-sections")
 
   if(WASM_EXT)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mbulk-memory -mnontrapping-fptoint -msign-ext -mtail-call")
@@ -121,6 +127,7 @@ elseif(WASIENV)
 
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Dd_m3HasTracer")
   set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -Wfatal-errors -fomit-frame-pointer -fno-stack-check -fno-stack-protector")
+  set(CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASE} -g")
 
   if(WASM_EXT)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mbulk-memory -mnontrapping-fptoint -msign-ext -mtail-call")
@@ -145,6 +152,7 @@ elseif(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT MATCHES "MSVC")
     endif()
 
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Oxs /Oy /GS- /Zi /Zo /arch:AVX2")
+    set(CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASE}")
 
     # Uncomment this if you want to disassemble the release build,
     # for example: dumpbin /DISASM wasm3.exe /out:wasm3.S
@@ -152,6 +160,7 @@ elseif(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT MATCHES "MSVC")
 
   else()
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Oxs /Oy /GS- /Qvec -Clang -O3")
+    set(CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASE} /Zi")
   endif()
 
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608") # stack size
@@ -181,8 +190,11 @@ else()
     endif()
   endif()
 
+  set(CMAKE_C_FLAGS_RELEASDBG "${CMAKE_C_FLAGS_RELEASE} -g")
+
   set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-O0")
   set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-O3")
+  set(CMAKE_EXE_LINKER_FLAGS_RELEASDBG "${CMAKE_EXE_LINKER_FLAGS_RELEASE}")
 
   target_link_libraries(${OUT_FILE} m)
 
@@ -225,8 +237,17 @@ add_subdirectory(source)
 message("Flags:         ${CMAKE_C_FLAGS}")
 message("Debug flags:   ${CMAKE_C_FLAGS_DEBUG}")
 message("Release flags: ${CMAKE_C_FLAGS_RELEASE}")
+message("ReleasDbg flags: ${CMAKE_C_FLAGS_RELEASDBG}")
 
 message("----")
+
+# Tests (optional)
+option(M3_BUILD_FP_TESTS "Build wasm3 floating-point edge tests" OFF)
+if(M3_BUILD_FP_TESTS AND NOT WASIENV AND NOT EMSCRIPTEN AND NOT EMSCRIPTEN_LIB)
+  add_executable(m3-fp-edge-test test/internal/m3_fp_edge_test.c)
+  target_link_libraries(m3-fp-edge-test m3 m)
+  target_include_directories(m3-fp-edge-test PRIVATE source)
+endif()
 
 # Install
 

@@ -23,6 +23,33 @@ cmake -GNinja -DCLANG_SUFFIX="-12" ..
 ninja
 ```
 
+To build an optimized binary with debug symbols (no stripping), use the custom build type `ReleasDbg`:
+
+```sh
+cmake -S . -B build-clang-releasdbg -GNinja -DCLANG=1 -DCMAKE_BUILD_TYPE=ReleasDbg
+cmake --build build-clang-releasdbg
+```
+
+### Clang (SYSROOT + lld)
+
+If your Clang toolchain requires a sysroot and lld, set `SYSROOT` and use the provided toolchain file or helper script:
+
+```sh
+export SYSROOT=/path/to/sysroot
+./build-clang-release.sh
+```
+
+Or, run CMake directly:
+
+```sh
+export SYSROOT=/path/to/sysroot
+cmake -S . -B build-clang-release -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/clang-sysroot-lld.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_WASI=simple
+cmake --build build-clang-release
+```
+
 ### GCC
 
 ```sh

@@ -9,6 +9,13 @@
 #include <stdlib.h>
 #include <time.h>
 #include <ctype.h>
+#include <stdint.h>
+
+#if defined(_WIN32)
+# include <windows.h>
+#elif defined(__APPLE__)
+# include <mach/mach_time.h>
+#endif
 
 #include "wasm3.h"
 #include "m3_api_libc.h"
@@ -43,6 +50,53 @@ static IM3Runtime runtime;
 
 static u8* wasm_bins[MAX_MODULES];
 static int wasm_bins_qty = 0;
+
+static
+bool g_full_compile_timer = false;
+
+static
+uint64_t monotonic_raw_time_ns (void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!QueryPerformanceFrequency(&freq) || !QueryPerformanceCounter(&now) || freq.QuadPart == 0) {
+        return UINT64_MAX;
+    }
+    const long double seconds = (long double) now.QuadPart / (long double) freq.QuadPart;
+    const long double ns = seconds * 1000000000.0L;
+    if (ns < 0.0L) {
+        return UINT64_MAX;
+    }
+    return (uint64_t) ns;
+#elif defined(__APPLE__)
+    static mach_timebase_info_data_t timebase = { 0 };
+    if (timebase.denom == 0) {
+        (void) mach_timebase_info(&timebase);
+        if (timebase.denom == 0) {
+            return UINT64_MAX;
+        }
+    }
+    const uint64_t t = mach_absolute_time();
+    const long double ns = ((long double) t) * (long double) timebase.numer / (long double) timebase.denom;
+    if (ns < 0.0L) {
+        return UINT64_MAX;
+    }
+    return (uint64_t) ns;
+#else
+    struct timespec ts;
+# if defined(CLOCK_MONOTONIC_RAW)
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+        return UINT64_MAX;
+    }
+# else
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return UINT64_MAX;
+    }
+# endif
+    return ((uint64_t) ts.tv_sec) * 1000000000ull + (uint64_t) ts.tv_nsec;
+#endif
+}
 
 #if defined(GAS_LIMIT)
 
@@ -434,7 +488,22 @@ M3Result repl_global_set  (const char* name, const char* value)
 
 M3Result repl_compile  ()
 {
-    return m3_CompileModule(runtime->modules);
+    const uint64_t t0_ns = g_full_compile_timer ? monotonic_raw_time_ns() : 0;
+    const M3Result result = m3_CompileModule(runtime->modules);
+    const uint64_t t1_ns = g_full_compile_timer ? monotonic_raw_time_ns() : 0;
+
+    if (g_full_compile_timer) {
+        if (t0_ns != UINT64_MAX && t1_ns != UINT64_MAX && t1_ns >= t0_ns) {
+            const double dt_ms = (double) (t1_ns - t0_ns) / 1000000.0;
+            fprintf(stderr, "wasm3: full compile %s in %.3f ms\n",
+                    result ? "failed" : "finished",
+                    dt_ms);
+        } else {
+            fprintf(stderr, "wasm3: full compile %s\n", result ? "failed" : "finished");
+        }
+    }
+
+    return result;
 }
 
 M3Result repl_dump  ()
@@ -552,6 +621,7 @@ void print_usage() {
     puts("  --func <function>     function to run       default: _start");
     puts("  --stack-size <size>   stack size in bytes   default: 64KB");
     puts("  --compile             disable lazy compilation");
+    puts("  --timer               print full compile time");
     puts("  --dump-on-trap        dump wasm memory");
     puts("  --gas-limit           set gas limit");
 }
@@ -568,6 +638,7 @@ int  main  (int i_argc, const char* i_argv[])
     bool argRepl = false;
     bool argDumpOnTrap = false;
     bool argCompile = false;
+    bool argTimer = false;
     const char* argFile = NULL;
     const char* argFunc = "_start";
     unsigned argStackSize = 64*1024;
@@ -594,6 +665,8 @@ int  main  (int i_argc, const char* i_argv[])
             argDumpOnTrap = true;
         } else if (!strcmp("--compile", arg)) {
             argCompile = true;
+        } else if (!strcmp("--timer", arg)) {
+            argTimer = true;
         } else if (!strcmp("--stack-size", arg)) {
             const char* tmp = "65536";
             ARGV_SET(tmp);
@@ -619,6 +692,8 @@ int  main  (int i_argc, const char* i_argv[])
     }
 
     ARGV_SET(argFile);
+
+    g_full_compile_timer = argTimer;
 
     result = repl_init(argStackSize);
     if (result) FATAL("repl_init: %s", result);

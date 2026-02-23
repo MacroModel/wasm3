@@ -151,6 +151,14 @@
 #   define d_m3SkipMemoryBoundsCheck            0       // skip memory bounds checks
 # endif
 
+# ifndef d_m3EnableLocalRegCaching
+#   define d_m3EnableLocalRegCaching            0       // AArch64 only: use remaining argument registers to cache hot locals
+# endif
+
+# ifndef d_m3EnableLocalRegCachingValidate
+#   define d_m3EnableLocalRegCachingValidate    0       // Debug: validate cached-local register values against stack slots
+# endif
+
 #define d_m3EnableCodePageRefCounting           0       // not supported currently
 
 #endif // m3_config_h

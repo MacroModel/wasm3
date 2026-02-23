@@ -77,6 +77,18 @@ typedef struct M3Function
 
     u16                     numConstantBytes;
     void *                  constants;
+
+# if d_m3EnableLocalRegCaching
+    // Local register cache (AArch64 only, see d_m3EnableLocalRegCaching).
+    // These caches are write-through to stack slots; code stream offsets for cached locals are encoded
+    // and decoded by the interpreter to read/write these registers instead of reloading from memory.
+    u8                      numLocalIntRegs;                         // [0..4]
+    u8                      numLocalFpRegs;                          // [0..7]
+    u16                     localIntRegSlots[4];                     // slot offsets (base) for cached int locals
+    u8                      localIntRegTypes[4];                     // c_m3Type_i32/i64
+    u16                     localFpRegSlots[7];                      // slot offsets (base) for cached fp locals
+    u8                      localFpRegTypes[7];                      // c_m3Type_f32/f64
+# endif
 }
 M3Function;
 

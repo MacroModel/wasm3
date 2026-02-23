@@ -16,10 +16,22 @@ d_m3BeginExternC
 # define m3MemRuntime(mem)              (((M3MemoryHeader*)(mem))->runtime)
 # define m3MemInfo(mem)                 (&(((M3MemoryHeader*)(mem))->runtime->memory))
 
-# define d_m3BaseOpSig                  pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0
-# define d_m3BaseOpArgs                 _sp, _mem, _r0
-# define d_m3BaseOpAllArgs              _pc, _sp, _mem, _r0
-# define d_m3BaseOpDefaultArgs          0
+# if d_m3EnableLocalRegCaching
+#   if !defined(__aarch64__)
+#     error "d_m3EnableLocalRegCaching is currently only supported on AArch64"
+#   endif
+    // AAPCS64 has 8 integer argument registers (x0-x7). wasm3 uses 4 fixed args (_pc/_sp/_mem/_r0),
+    // leaving 4 to cache hot locals (_r1.._r4).
+#   define d_m3BaseOpSig                  pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0, m3reg_t _r1, m3reg_t _r2, m3reg_t _r3, m3reg_t _r4
+#   define d_m3BaseOpArgs                 _sp, _mem, _r0, _r1, _r2, _r3, _r4
+#   define d_m3BaseOpAllArgs              _pc, _sp, _mem, _r0, _r1, _r2, _r3, _r4
+#   define d_m3BaseOpDefaultArgs          0, 0, 0, 0, 0
+# else
+#   define d_m3BaseOpSig                  pc_t _pc, m3stack_t _sp, M3MemoryHeader * _mem, m3reg_t _r0
+#   define d_m3BaseOpArgs                 _sp, _mem, _r0
+#   define d_m3BaseOpAllArgs              _pc, _sp, _mem, _r0
+#   define d_m3BaseOpDefaultArgs          0
+# endif
 # define d_m3BaseClearRegisters         _r0 = 0;
 # define d_m3BaseCstr                   ""
 
@@ -30,17 +42,66 @@ d_m3BeginExternC
 # define d_m3ExpClearRegisters(...)     d_m3BaseClearRegisters; __VA_ARGS__
 
 # if d_m3HasFloat
-#   define d_m3OpSig                d_m3ExpOpSig            (f64 _fp0)
-#   define d_m3OpArgs               d_m3ExpOpArgs           (_fp0)
-#   define d_m3OpAllArgs            d_m3ExpOpAllArgs        (_fp0)
-#   define d_m3OpDefaultArgs        d_m3ExpOpDefaultArgs    (0.)
-#   define d_m3ClearRegisters       d_m3ExpClearRegisters   (_fp0 = 0.;)
+#   if d_m3EnableLocalRegCaching
+        // AAPCS64 has 8 FP/SIMD argument registers (v0-v7). wasm3 uses 1 fixed arg (_fp0),
+        // leaving 7 to cache hot locals (_fp1.._fp7).
+#       define d_m3OpSig                d_m3ExpOpSig            (f64 _fp0, f64 _fp1, f64 _fp2, f64 _fp3, f64 _fp4, f64 _fp5, f64 _fp6, f64 _fp7)
+#       define d_m3OpArgs               d_m3ExpOpArgs           (_fp0, _fp1, _fp2, _fp3, _fp4, _fp5, _fp6, _fp7)
+#       define d_m3OpAllArgs            d_m3ExpOpAllArgs        (_fp0, _fp1, _fp2, _fp3, _fp4, _fp5, _fp6, _fp7)
+#       define d_m3OpDefaultArgs        d_m3ExpOpDefaultArgs    (0., 0., 0., 0., 0., 0., 0., 0.)
+#       define d_m3ClearRegisters       d_m3ExpClearRegisters   (_fp0 = 0.;)
+#   else
+#       define d_m3OpSig                d_m3ExpOpSig            (f64 _fp0)
+#       define d_m3OpArgs               d_m3ExpOpArgs           (_fp0)
+#       define d_m3OpAllArgs            d_m3ExpOpAllArgs        (_fp0)
+#       define d_m3OpDefaultArgs        d_m3ExpOpDefaultArgs    (0.)
+#       define d_m3ClearRegisters       d_m3ExpClearRegisters   (_fp0 = 0.;)
+#   endif
 # else
 #   define d_m3OpSig                d_m3BaseOpSig
 #   define d_m3OpArgs               d_m3BaseOpArgs
 #   define d_m3OpAllArgs            d_m3BaseOpAllArgs
 #   define d_m3OpDefaultArgs        d_m3BaseOpDefaultArgs
 #   define d_m3ClearRegisters       d_m3BaseClearRegisters
+# endif
+
+# if d_m3EnableLocalRegCaching
+    // Slot offset encoding for cached locals.
+    // Encoded offsets are negative i32 values in the code stream.
+    // [31] tag (1)
+    // [30] kind (0=int, 1=fp)
+    // [29..26] reg index
+    // [25..0] slot offset (in m3slot_t units)
+    #define d_m3LocalOffsetTagMask       0x80000000u
+    #define d_m3LocalOffsetKindMask      0x40000000u
+    #define d_m3LocalOffsetRegShift      26u
+    #define d_m3LocalOffsetRegMask       0x3Cu
+    #define d_m3LocalOffsetSlotMask      0x03FFFFFFu
+
+    static inline u32  m3EncodeLocalOffset  (u32 i_kind, u32 i_regIndex, u32 i_slotOffset)
+    {
+        return d_m3LocalOffsetTagMask | ((i_kind & 1u) << 30u) | ((i_regIndex & 0xFu) << d_m3LocalOffsetRegShift) | (i_slotOffset & d_m3LocalOffsetSlotMask);
+    }
+
+    static inline bool  m3IsEncodedLocalOffset  (i32 i_offset)
+    {
+        return i_offset < 0;
+    }
+
+    static inline u32  m3DecodeLocalOffsetKind  (u32 i_encoded)
+    {
+        return (i_encoded >> 30u) & 1u;
+    }
+
+    static inline u32  m3DecodeLocalOffsetRegIndex  (u32 i_encoded)
+    {
+        return (i_encoded >> d_m3LocalOffsetRegShift) & 0xFu;
+    }
+
+    static inline u32  m3DecodeLocalOffsetSlot  (u32 i_encoded)
+    {
+        return i_encoded & d_m3LocalOffsetSlotMask;
+    }
 # endif
 
 

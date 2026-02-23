@@ -22,6 +22,17 @@ target_include_directories(m3 PUBLIC .)
 
 target_compile_features(m3 PRIVATE c_std_99)
 
+if (M3_LOCAL_REGCACHE)
+    target_compile_definitions(m3 PUBLIC d_m3EnableLocalRegCaching=1)
+    if (M3_LOCAL_REGCACHE_VALIDATE)
+        target_compile_definitions(m3 PUBLIC d_m3EnableLocalRegCachingValidate=1)
+    endif()
+endif()
+
+if (M3_RECORD_BACKTRACES)
+    target_compile_definitions(m3 PUBLIC d_m3RecordBacktraces=1)
+endif()
+
 if (CMAKE_C_COMPILER_ID MATCHES "MSVC")
     # add MSVC specific flags here
 else()

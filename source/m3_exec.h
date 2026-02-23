@@ -33,6 +33,9 @@
 #include "m3_exec_defs.h"
 
 #include <limits.h>
+#if d_m3EnableLocalRegCaching && d_m3EnableLocalRegCachingValidate
+#include <stdio.h>
+#endif
 
 d_m3BeginExternC
 
@@ -41,8 +44,220 @@ d_m3BeginExternC
 # define immediate(TYPE)            * ((TYPE *) _pc++)
 # define skip_immediate(TYPE)       (_pc++)
 
-# define slot(TYPE)                 * (TYPE *) (_sp + immediate (i32))
-# define slot_ptr(TYPE)             (TYPE *) (_sp + immediate (i32))
+#if d_m3EnableLocalRegCaching
+    #if !(defined(__clang__) || defined(__GNUC__))
+        #error "d_m3EnableLocalRegCaching requires a compiler that supports statement expressions"
+    #endif
+
+    static inline u32  m3DecodeSlotOffset  (i32 i_offset)
+    {
+        if (M3_LIKELY(not m3IsEncodedLocalOffset (i_offset)))
+            return (u32) i_offset;
+        return m3DecodeLocalOffsetSlot ((u32) i_offset);
+    }
+
+    static inline u64  m3BitcastF64ToU64  (f64 i_value)
+    {
+        union { f64 f; u64 u; } u;
+        u.f = i_value;
+        return u.u;
+    }
+
+    static inline f64  m3BitcastU64ToF64  (u64 i_value)
+    {
+        union { u64 u; f64 f; } u;
+        u.u = i_value;
+        return u.f;
+    }
+
+    #define M3_GET_LOCAL_INT_REG(REG)   \
+        ((REG) == 0 ? _r1 : (REG) == 1 ? _r2 : (REG) == 2 ? _r3 : (REG) == 3 ? _r4 : 0)
+
+    #if d_m3HasFloat
+        #define M3_GET_LOCAL_FP_REG(REG)    \
+            ((REG) == 0 ? _fp1 : (REG) == 1 ? _fp2 : (REG) == 2 ? _fp3 : (REG) == 3 ? _fp4 : (REG) == 4 ? _fp5 : (REG) == 5 ? _fp6 : (REG) == 6 ? _fp7 : 0.)
+    #else
+        #define M3_GET_LOCAL_FP_REG(REG)    (0.)
+    #endif
+
+    #define M3_SET_LOCAL_INT_REG(REG, VALUE)                 \
+        do {                                                 \
+            switch (REG) {                                   \
+                case 0: _r1 = (m3reg_t) (VALUE); break;      \
+                case 1: _r2 = (m3reg_t) (VALUE); break;      \
+                case 2: _r3 = (m3reg_t) (VALUE); break;      \
+                case 3: _r4 = (m3reg_t) (VALUE); break;      \
+                default: break;                              \
+            }                                                \
+        } while (0)
+
+    #if d_m3HasFloat
+        #define M3_SET_LOCAL_FP_REG(REG, VALUE)                  \
+            do {                                                 \
+                switch (REG) {                                   \
+                    case 0: _fp1 = (f64) (VALUE); break;         \
+                    case 1: _fp2 = (f64) (VALUE); break;         \
+                    case 2: _fp3 = (f64) (VALUE); break;         \
+                    case 3: _fp4 = (f64) (VALUE); break;         \
+                    case 4: _fp5 = (f64) (VALUE); break;         \
+                    case 5: _fp6 = (f64) (VALUE); break;         \
+                    case 6: _fp7 = (f64) (VALUE); break;         \
+                    default: break;                              \
+                }                                                \
+            } while (0)
+    #else
+        #define M3_SET_LOCAL_FP_REG(REG, VALUE)                  \
+            do { (void) (REG); (void) (VALUE); } while (0)
+    #endif
+
+    #define M3_SLOT_LOAD(TYPE, OFFSET_EXPR)                                             \
+        ({                                                                              \
+            const i32 _m3_off = (OFFSET_EXPR);                                          \
+            TYPE _m3_val;                                                               \
+            if (M3_LIKELY(_m3_off >= 0))                                                \
+                _m3_val = * (TYPE *) (_sp + (u32) _m3_off);                             \
+            else                                                                        \
+            {                                                                           \
+                const u32 _m3_enc = (u32) _m3_off;                                      \
+                const u32 _m3_kind = m3DecodeLocalOffsetKind (_m3_enc);                 \
+                const u32 _m3_reg = m3DecodeLocalOffsetRegIndex (_m3_enc);              \
+                if (_m3_kind)                                                          \
+                {                                                                       \
+                    const f64 _m3_fp = (f64) M3_GET_LOCAL_FP_REG (_m3_reg);             \
+                    if (__builtin_types_compatible_p (TYPE, u64) || __builtin_types_compatible_p (TYPE, i64)) \
+                        _m3_val = (TYPE) m3BitcastF64ToU64 (_m3_fp);                    \
+                    else                                                                \
+                        _m3_val = (TYPE) _m3_fp;                                       \
+                }                                                                       \
+                else                                                                    \
+                    _m3_val = (TYPE) M3_GET_LOCAL_INT_REG (_m3_reg);                   \
+                if (d_m3EnableLocalRegCachingValidate)                                  \
+                {                                                                       \
+                    const u32 _m3_slot = m3DecodeLocalOffsetSlot (_m3_enc);             \
+                    const TYPE _m3_mem_val = * (TYPE *) (_sp + _m3_slot);               \
+                    if (M3_UNLIKELY(memcmp (& _m3_mem_val, & _m3_val, sizeof (TYPE)) != 0)) \
+                    {                                                                   \
+                        fprintf (stderr, "m3 local-regcache mismatch: kind=%u slot=%u reg=%u off=%d\\n", _m3_kind, _m3_slot, _m3_reg, _m3_off); \
+                        m3_Abort ("local-regcache mismatch");                           \
+                    }                                                                   \
+                }                                                                       \
+            }                                                                           \
+            _m3_val;                                                                    \
+        })
+
+    #define M3_SLOT_STORE(TYPE, OFFSET_EXPR, VALUE_EXPR)                                \
+        do {                                                                            \
+            const i32 _m3_off = (OFFSET_EXPR);                                          \
+            const TYPE _m3_val = (TYPE) (VALUE_EXPR);                                   \
+            if (M3_LIKELY(_m3_off >= 0))                                                \
+            {                                                                           \
+                * (TYPE *) (_sp + (u32) _m3_off) = _m3_val;                             \
+            }                                                                           \
+            else                                                                        \
+            {                                                                           \
+                const u32 _m3_enc = (u32) _m3_off;                                      \
+                const u32 _m3_kind = m3DecodeLocalOffsetKind (_m3_enc);                 \
+                const u32 _m3_reg = m3DecodeLocalOffsetRegIndex (_m3_enc);              \
+                const u32 _m3_slot = m3DecodeLocalOffsetSlot (_m3_enc);                 \
+                if (_m3_kind)                                                           \
+                {                                                                       \
+                    if (__builtin_types_compatible_p (TYPE, u64) || __builtin_types_compatible_p (TYPE, i64)) \
+                        M3_SET_LOCAL_FP_REG (_m3_reg, m3BitcastU64ToF64 ((u64) _m3_val)); \
+                    else                                                                \
+                        M3_SET_LOCAL_FP_REG (_m3_reg, _m3_val);                         \
+                }                                                                       \
+                else                                                                    \
+                    M3_SET_LOCAL_INT_REG (_m3_reg, _m3_val);                            \
+                * (TYPE *) (_sp + _m3_slot) = _m3_val;                                  \
+            }                                                                           \
+        } while (0)
+
+    #define slot(TYPE)                 M3_SLOT_LOAD (TYPE, immediate (i32))
+    #define slot_ptr(TYPE)             (TYPE *) (_sp + m3DecodeSlotOffset (immediate (i32)))
+    #define slot_store(TYPE, VALUE)    M3_SLOT_STORE (TYPE, immediate (i32), (VALUE))
+#else
+    #define M3_SLOT_LOAD(TYPE, OFFSET_EXPR)                 (* (TYPE *) (_sp + (OFFSET_EXPR)))
+    #define M3_SLOT_STORE(TYPE, OFFSET_EXPR, VALUE_EXPR)    (* (TYPE *) (_sp + (OFFSET_EXPR)) = (TYPE) (VALUE_EXPR))
+
+    #define slot(TYPE)                 * (TYPE *) (_sp + immediate (i32))
+    #define slot_ptr(TYPE)             (TYPE *) (_sp + immediate (i32))
+    #define slot_store(TYPE, VALUE)    (slot (TYPE) = (TYPE) (VALUE))
+#endif
+
+#if d_m3EnableLocalRegCaching
+static inline m3reg_t  m3LoadLocalInt  (m3stack_t i_sp, u16 i_slot, u8 i_type)
+{
+    if (i_type == c_m3Type_i32)
+        return (m3reg_t) * (i32 *) (i_sp + i_slot);
+    else
+        return (m3reg_t) * (i64 *) (i_sp + i_slot);
+}
+
+#if d_m3HasFloat
+static inline f64  m3LoadLocalFp  (m3stack_t i_sp, u16 i_slot, u8 i_type)
+{
+    if (i_type == c_m3Type_f32)
+        return (f64) * (f32 *) (i_sp + i_slot);
+    else
+        return * (f64 *) (i_sp + i_slot);
+}
+#endif
+
+#define M3_CLEAR_LOCAL_INT_REGS()                 \
+    do {                                          \
+        _r1 = 0; _r2 = 0; _r3 = 0; _r4 = 0;        \
+    } while (0)
+
+#if d_m3HasFloat
+    #define M3_CLEAR_LOCAL_FP_REGS()                  \
+        do {                                           \
+            _fp1 = 0.; _fp2 = 0.; _fp3 = 0.; _fp4 = 0.; \
+            _fp5 = 0.; _fp6 = 0.; _fp7 = 0.;           \
+        } while (0)
+#else
+    #define M3_CLEAR_LOCAL_FP_REGS()                  \
+        do {} while (0)
+#endif
+
+#define M3_CLEAR_LOCAL_REGS()                     \
+    do {                                          \
+        M3_CLEAR_LOCAL_INT_REGS ();               \
+        M3_CLEAR_LOCAL_FP_REGS ();                \
+    } while (0)
+
+#if d_m3HasFloat
+    #define M3_RELOAD_LOCAL_REGS(FUNCTION)                                        \
+        do {                                                                      \
+            M3_CLEAR_LOCAL_REGS ();                                               \
+                                                                                  \
+            const u8 _m3_ni = (FUNCTION)->numLocalIntRegs;                        \
+            if (_m3_ni > 0) _r1 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[0], (FUNCTION)->localIntRegTypes[0]); \
+            if (_m3_ni > 1) _r2 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[1], (FUNCTION)->localIntRegTypes[1]); \
+            if (_m3_ni > 2) _r3 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[2], (FUNCTION)->localIntRegTypes[2]); \
+            if (_m3_ni > 3) _r4 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[3], (FUNCTION)->localIntRegTypes[3]); \
+                                                                                  \
+            const u8 _m3_nf = (FUNCTION)->numLocalFpRegs;                         \
+            if (_m3_nf > 0) _fp1 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[0], (FUNCTION)->localFpRegTypes[0]);    \
+            if (_m3_nf > 1) _fp2 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[1], (FUNCTION)->localFpRegTypes[1]);    \
+            if (_m3_nf > 2) _fp3 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[2], (FUNCTION)->localFpRegTypes[2]);    \
+            if (_m3_nf > 3) _fp4 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[3], (FUNCTION)->localFpRegTypes[3]);    \
+            if (_m3_nf > 4) _fp5 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[4], (FUNCTION)->localFpRegTypes[4]);    \
+            if (_m3_nf > 5) _fp6 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[5], (FUNCTION)->localFpRegTypes[5]);    \
+            if (_m3_nf > 6) _fp7 = m3LoadLocalFp (_sp, (FUNCTION)->localFpRegSlots[6], (FUNCTION)->localFpRegTypes[6]);    \
+        } while (0)
+#else
+    #define M3_RELOAD_LOCAL_REGS(FUNCTION)                                        \
+        do {                                                                      \
+            M3_CLEAR_LOCAL_REGS ();                                               \
+                                                                                  \
+            const u8 _m3_ni = (FUNCTION)->numLocalIntRegs;                        \
+            if (_m3_ni > 0) _r1 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[0], (FUNCTION)->localIntRegTypes[0]); \
+            if (_m3_ni > 1) _r2 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[1], (FUNCTION)->localIntRegTypes[1]); \
+            if (_m3_ni > 2) _r3 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[2], (FUNCTION)->localIntRegTypes[2]); \
+            if (_m3_ni > 3) _r4 = m3LoadLocalInt (_sp, (FUNCTION)->localIntRegSlots[3], (FUNCTION)->localIntRegTypes[3]); \
+        } while (0)
+#endif
+#endif // d_m3EnableLocalRegCaching
 
 
 # if d_m3EnableOpProfiling
@@ -95,12 +310,12 @@ d_m3BeginExternC
 
 #ifdef DEBUG
   #define d_outOfBounds newTrap (ErrorRuntime (m3Err_trapOutOfBoundsMemoryAccess,   \
-                        _mem->runtime, "memory size: %zu; access offset: %zu",      \
-                        _mem->length, operand))
+                        _mem->runtime, "op: %s; memory size: %zu; access offset: %zu", \
+                        __FUNCTION__, _mem->length, operand))
 
 #   define d_outOfBoundsMemOp(OFFSET, SIZE) newTrap (ErrorRuntime (m3Err_trapOutOfBoundsMemoryAccess,   \
-                      _mem->runtime, "memory size: %zu; access offset: %zu; size: %u",     \
-                      _mem->length, OFFSET, SIZE))
+                      _mem->runtime, "op: %s; memory size: %zu; access offset: %zu; size: %u",     \
+                      __FUNCTION__, _mem->length, OFFSET, SIZE))
 #else
   #define d_outOfBounds newTrap (m3Err_trapOutOfBoundsMemoryAccess)
 
@@ -431,7 +646,7 @@ d_m3Op(TO##_##NAME##_##FROM##_r_r)                          \
                                                             \
 d_m3Op(TO##_##NAME##_##FROM##_s_r)                          \
 {                                                           \
-    slot (TO) = (TO) ((FROM) REG_FROM);                     \
+    slot_store (TO, (TO) ((FROM) REG_FROM));                \
     nextOp ();                                              \
 }                                                           \
                                                             \
@@ -445,7 +660,7 @@ d_m3Op(TO##_##NAME##_##FROM##_r_s)                          \
 d_m3Op(TO##_##NAME##_##FROM##_s_s)                          \
 {                                                           \
     FROM from = slot (FROM);                                \
-    slot (TO) = (TO) (from);                                \
+    slot_store (TO, (TO) (from));                           \
     nextOp ();                                              \
 }
 
@@ -483,7 +698,7 @@ d_m3Op(TO##_Reinterpret_##FROM##_s_r)                       \
 {                                                           \
     union { FROM c; TO t; } u;                              \
     u.c = (FROM) SRC;                                       \
-    slot (TO) = u.t;                                        \
+    slot_store (TO, u.t);                                   \
     nextOp ();                                              \
 }                                                           \
                                                             \
@@ -491,7 +706,7 @@ d_m3Op(TO##_Reinterpret_##FROM##_s_s)                       \
 {                                                           \
     union { FROM c; TO t; } u;                              \
     u.c = slot (FROM);                                      \
-    slot (TO) = u.t;                                        \
+    slot_store (TO, u.t);                                   \
     nextOp ();                                              \
 }
 
@@ -506,7 +721,7 @@ d_m3ReinterpretOp (_fp0, f64, _r0, i64)
 d_m3Op  (GetGlobal_s32)
 {
     u32 * global = immediate (u32 *);
-    slot (u32) = * global;                        //  printf ("get global: %p %" PRIi64 "\n", global, *global);
+    slot_store (u32, * global);                   //  printf ("get global: %p %" PRIi64 "\n", global, *global);
 
     nextOp ();
 }
@@ -515,7 +730,7 @@ d_m3Op  (GetGlobal_s32)
 d_m3Op  (GetGlobal_s64)
 {
     u64 * global = immediate (u64 *);
-    slot (u64) = * global;                        // printf ("get global: %p %" PRIi64 "\n", global, *global);
+    slot_store (u64, * global);                   // printf ("get global: %p %" PRIi64 "\n", global, *global);
 
     nextOp ();
 }
@@ -556,7 +771,13 @@ d_m3Op  (Call)
     _mem = memory->mallocated;
 
     if (M3_LIKELY(not r))
+    {
+#if d_m3EnableLocalRegCaching
+        IM3Function caller = immediate (IM3Function);
+        M3_RELOAD_LOCAL_REGS (caller);
+#endif
         nextOp ();
+    }
     else
     {
         pushBacktraceFrame ();
@@ -600,7 +821,13 @@ d_m3Op  (CallIndirect)
                     _mem = memory->mallocated;
 
                     if (M3_LIKELY(not r))
+                    {
+#if d_m3EnableLocalRegCaching
+                        IM3Function caller = immediate (IM3Function);
+                        M3_RELOAD_LOCAL_REGS (caller);
+#endif
                         nextOpDirect ();
+                    }
                     else
                     {
                         pushBacktraceFrame ();
@@ -832,6 +1059,10 @@ d_m3Op  (Entry)
         trace_rt->callDepth++;
 #endif
 
+#if d_m3EnableLocalRegCaching
+        M3_RELOAD_LOCAL_REGS (function);
+#endif
+
         m3ret_t r = nextOpImpl ();
 
 #if d_m3EnableStrace >= 2
@@ -871,6 +1102,10 @@ d_m3Op  (Loop)
 
     m3ret_t r;
 
+#if d_m3EnableLocalRegCaching
+    IM3Function function = immediate (IM3Function);
+#endif
+
     IM3Memory memory = m3MemInfo (_mem);
 
     do
@@ -878,6 +1113,10 @@ d_m3Op  (Loop)
 #if d_m3EnableStrace >= 3
         d_m3TracePrint("iter {");
         trace_rt->callDepth++;
+#endif
+
+#if d_m3EnableLocalRegCaching
+        M3_RELOAD_LOCAL_REGS (function);
 #endif
         r = nextOpImpl ();
 
@@ -950,17 +1189,18 @@ d_m3Op  (SetRegister_##TYPE)            \
                                         \
 d_m3Op (SetSlot_##TYPE)                 \
 {                                       \
-    slot (TYPE) = (TYPE) REG;           \
+    slot_store (TYPE, (TYPE) REG);      \
     nextOp ();                          \
 }                                       \
                                         \
 d_m3Op (PreserveSetSlot_##TYPE)         \
 {                                       \
-    TYPE * stack     = slot_ptr (TYPE); \
-    TYPE * preserve  = slot_ptr (TYPE); \
-                                        \
-    * preserve = * stack;               \
-    * stack = (TYPE) REG;               \
+    const i32 stackOffset = immediate (i32);         \
+    const i32 preserveOffset = immediate (i32);      \
+                                                    \
+    const TYPE oldValue = M3_SLOT_LOAD (TYPE, stackOffset);  \
+    M3_SLOT_STORE (TYPE, preserveOffset, oldValue);          \
+    M3_SLOT_STORE (TYPE, stackOffset, (TYPE) REG);           \
                                         \
     nextOp ();                          \
 }
@@ -974,10 +1214,11 @@ d_m3SetRegisterSetSlot (f64, _fp0)
 
 d_m3Op (CopySlot_32)
 {
-    u32 * dst = slot_ptr (u32);
-    u32 * src = slot_ptr (u32);
+    const i32 dstOffset = immediate (i32);
+    const i32 srcOffset = immediate (i32);
 
-    * dst = * src;
+    const u32 value = M3_SLOT_LOAD (u32, srcOffset);
+    M3_SLOT_STORE (u32, dstOffset, value);
 
     nextOp ();
 }
@@ -985,12 +1226,15 @@ d_m3Op (CopySlot_32)
 
 d_m3Op (PreserveCopySlot_32)
 {
-    u32 * dest      = slot_ptr (u32);
-    u32 * src       = slot_ptr (u32);
-    u32 * preserve  = slot_ptr (u32);
+    const i32 destOffset = immediate (i32);
+    const i32 srcOffset = immediate (i32);
+    const i32 preserveOffset = immediate (i32);
 
-    * preserve = * dest;
-    * dest = * src;
+    const u32 oldValue = M3_SLOT_LOAD (u32, destOffset);
+    M3_SLOT_STORE (u32, preserveOffset, oldValue);
+
+    const u32 value = M3_SLOT_LOAD (u32, srcOffset);
+    M3_SLOT_STORE (u32, destOffset, value);
 
     nextOp ();
 }
@@ -998,10 +1242,11 @@ d_m3Op (PreserveCopySlot_32)
 
 d_m3Op (CopySlot_64)
 {
-    u64 * dst = slot_ptr (u64);
-    u64 * src = slot_ptr (u64);
+    const i32 dstOffset = immediate (i32);
+    const i32 srcOffset = immediate (i32);
 
-    * dst = * src;                  // printf ("copy: %p <- %" PRIi64 " <- %p\n", dst, * dst, src);
+    const u64 value = M3_SLOT_LOAD (u64, srcOffset);
+    M3_SLOT_STORE (u64, dstOffset, value);    // printf ("copy: %p <- %" PRIi64 "\n", dst, * dst);
 
     nextOp ();
 }
@@ -1009,12 +1254,15 @@ d_m3Op (CopySlot_64)
 
 d_m3Op (PreserveCopySlot_64)
 {
-    u64 * dest      = slot_ptr (u64);
-    u64 * src       = slot_ptr (u64);
-    u64 * preserve  = slot_ptr (u64);
+    const i32 destOffset = immediate (i32);
+    const i32 srcOffset = immediate (i32);
+    const i32 preserveOffset = immediate (i32);
 
-    * preserve = * dest;
-    * dest = * src;
+    const u64 oldValue = M3_SLOT_LOAD (u64, destOffset);
+    M3_SLOT_STORE (u64, preserveOffset, oldValue);
+
+    const u64 value = M3_SLOT_LOAD (u64, srcOffset);
+    M3_SLOT_STORE (u64, destOffset, value);
 
     nextOp ();
 }
@@ -1241,7 +1489,7 @@ d_m3Op  (ContinueLoopIf)
 d_m3Op  (Const32)
 {
     u32 value = * (u32 *)_pc++;
-    slot (u32) = value;
+    slot_store (u32, value);
     nextOp ();
 }
 
@@ -1250,7 +1498,7 @@ d_m3Op  (Const64)
 {
     u64 value = * (u64 *)_pc;
     _pc += (M3_SIZEOF_PTR == 4) ? 2 : 1;
-    slot (u64) = value;
+    slot_store (u64, value);
     nextOp ();
 }
 
